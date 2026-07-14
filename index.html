@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QR File Sender (Web版)</title>
+<style>
+  body {
+    font-family: sans-serif;
+    background: #222;
+    color: #eee;
+    margin: 0;
+    padding: 16px;
+  }
+  h2 { margin-top: 0; }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  label { font-size: 14px; }
+  input[type="number"] {
+    width: 80px;
+    padding: 4px;
+  }
+  button {
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  #dropZone {
+    border: 2px dashed #555;
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+    margin-bottom: 10px;
+    background: #2a2a2a;
+  }
+  #dropZone.dragover {
+    border-color: #4caf50;
+    background: #2f3f2f;
+  }
+  #status {
+    white-space: pre-wrap;
+    font-family: monospace;
+    background: #111;
+    padding: 8px;
+    margin-bottom: 10px;
+    min-height: 20px;
+  }
+  #trackBarLabel { font-size: 13px; color: #ccc; margin-bottom: 4px; }
+  #frameSlider { width: 100%; }
+
+  /*
+    表示領域全体。1枚モードでは正方形(aspect-ratio 1/1)、
+    2枚モードでは横長(2:1)または縦長(1:2)にJSで切り替える。
+    どちらの場合も、幅いっぱいに内接させる。
+  */
+  #qrContainer {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: white;
+    border: 1px solid #555;
+    width: 100%;
+    max-width: 480px;
+    margin: 0 auto;
+    gap: 2px;
+  }
+  #qrContainer.single {
+    aspect-ratio: 1 / 1;
+  }
+  #qrContainer.dual-horizontal {
+    aspect-ratio: 2 / 1; /* 横に2枚並べる: 幅は高さの2倍 */
+    flex-direction: row;
+  }
+  #qrContainer.dual-vertical {
+    aspect-ratio: 1 / 2; /* 縦に2枚並べる: 高さは幅の2倍 */
+    flex-direction: column;
+  }
+  .qrSlot {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+  }
+  .qrSlot canvas {
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+  }
+  #qrSlot2.hidden {
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<h2>QR File Sender (Web版)</h2>
+
+<div id="dropZone">
+  ここにファイルをドラッグ&ドロップ、またはボタンでファイルを選択してください
+  <div class="row" style="justify-content:center; margin-top:8px;">
+    <input type="file" id="fileInput">
+  </div>
+</div>
+
+<div class="row">
+  <label for="intervalInput">切替間隔(ms):</label>
+  <input type="number" id="intervalInput" value="800" min="200" max="10000" step="100">
+
+  <label for="chunkSizeInput">1枚あたりバイト数:</label>
+  <input type="number" id="chunkSizeInput" value="100" min="16" max="1000" step="10">
+
+  <button id="startStopButton" disabled>送信開始</button>
+</div>
+
+<div class="row">
+  <label>
+    <input type="checkbox" id="dualModeCheckbox">
+    2枚同時表示(1回の切替で2フレーム進みます。表示領域の縦横比に応じて自動で縦並び/横並びになります)
+  </label>
+</div>
+
+<div id="trackBarLabel">表示フレーム: - / -(スライダーで任意のフレームへジャンプできます)</div>
+<input type="range" id="frameSlider" min="0" max="0" value="0" disabled>
+
+<div id="status">ファイルを選択してください。</div>
+
+<div id="qrContainer" class="single">
+  <div class="qrSlot" id="qrSlot1"><canvas id="qrCanvas1"></canvas></div>
+  <div class="qrSlot hidden" id="qrSlot2"><canvas id="qrCanvas2"></canvas></div>
+</div>
+
+<!--
+  qrcode-generator (MITライセンス, https://github.com/kazuhikoarase/qrcode-generator)
+  を、このHTMLと同じ場所に qrcode.js として配置してください。
+-->
+<script src="qrcode.js"></script>
+<script>
+'use strict';
+
+// ============================================================
+// フレームフォーマット(C#版 QrFileSender と共通仕様)
+//
+//   先頭フレーム(FrameIndex=0):
+//     Magic(1) + TotalFrames(2) + FrameIndex(2) + FileNameLen(1) + FileName(UTF8, 可変長)
+//     + ChunkLen(2) + ChunkData(可変長)
+//   後続フレーム:
+//     Magic(1) + TotalFrames(2) + FrameIndex(2) + ChunkLen(2) + ChunkData(可変長)
+//
+//   Magic = 0xB7
+//   TotalFrames, FrameIndex, ChunkLen はすべてビッグエンディアン16bit
+//   QRコード自体がリード・ソロモン誤り訂正を内蔵しているため、追加のCRC等は付与しない。
+//
+//   2枚同時表示は、あくまで「1回の切替で2フレーム分を並べて見せる」表示上の機能であり、
+//   フレーム自体のフォーマットや意味は1枚モードと同じ(受信側の変更は不要)。
+// ============================================================
+
+const MAGIC = 0xB7;
+
+/**
+ * ファイルのバイナリデータとファイル名から、QRコードに格納するフレーム
+ * (Uint8Arrayの配列)を生成する。
+ */
+function buildFrames(fileBytes, fileName, chunkCapacity) {
+  const fileNameBytes = new TextEncoder().encode(fileName);
+  if (fileNameBytes.length > 255) {
+    throw new Error('ファイル名が長すぎます(UTF8で255バイト以内にしてください)。');
+  }
+
+  const headerSizeFirstFrameFixed = 8; // Magic+TotalFrames+FrameIndex+FileNameLen+ChunkLen
+  const headerSizeRestFrame = 7;       // Magic+TotalFrames+FrameIndex+ChunkLen
+
+  const firstFrameMaxChunk = chunkCapacity - headerSizeFirstFrameFixed - fileNameBytes.length;
+  const restFrameMaxChunk = chunkCapacity - headerSizeRestFrame;
+
+  if (firstFrameMaxChunk <= 0) {
+    throw new Error('ファイル名が長すぎて、先頭フレームにデータを格納できません。');
+  }
+  if (restFrameMaxChunk <= 0) {
+    throw new Error('1枚あたりバイト数が小さすぎます。');
+  }
+
+  const chunks = [];
+  let offset = 0;
+  const firstChunkLen = Math.min(firstFrameMaxChunk, fileBytes.length);
+  chunks.push(fileBytes.slice(offset, offset + firstChunkLen));
+  offset += firstChunkLen;
+
+  while (offset < fileBytes.length) {
+    const len = Math.min(restFrameMaxChunk, fileBytes.length - offset);
+    chunks.push(fileBytes.slice(offset, offset + len));
+    offset += len;
+  }
+
+  if (chunks.length === 0) {
+    chunks.push(new Uint8Array(0)); // 0バイトファイルでも1フレームは送る
+  }
+
+  const totalFrames = chunks.length;
+  const frames = [];
+
+  for (let i = 0; i < totalFrames; i++) {
+    const chunk = chunks[i];
+    const parts = [];
+
+    parts.push(MAGIC);
+    pushUInt16(parts, totalFrames);
+    pushUInt16(parts, i);
+
+    if (i === 0) {
+      parts.push(fileNameBytes.length);
+      for (let j = 0; j < fileNameBytes.length; j++) {
+        parts.push(fileNameBytes[j]);
+      }
+    }
+
+    pushUInt16(parts, chunk.length);
+    for (let j = 0; j < chunk.length; j++) {
+      parts.push(chunk[j]);
+    }
+
+    frames.push(new Uint8Array(parts));
+  }
+
+  return frames;
+}
+
+function pushUInt16(arr, value) {
+  arr.push((value >> 8) & 0xff);
+  arr.push(value & 0xff);
+}
+
+// ============================================================
+// qrcode-generator のバイナリ対応
+// stringToBytes を上書きし、文字列の各文字コード(0-255)をそのまま
+// バイト値として扱う(Latin1的な1バイト1文字の対応にする)。
+// ============================================================
+qrcode.stringToBytes = function (s) {
+  const bytes = [];
+  for (let i = 0; i < s.length; i++) {
+    bytes.push(s.charCodeAt(i) & 0xff);
+  }
+  return bytes;
+};
+
+function bytesToBinaryString(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) {
+    s += String.fromCharCode(bytes[i]);
+  }
+  return s;
+}
+
+// ============================================================
+// UI制御
+// ============================================================
+
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const intervalInput = document.getElementById('intervalInput');
+const chunkSizeInput = document.getElementById('chunkSizeInput');
+const startStopButton = document.getElementById('startStopButton');
+const dualModeCheckbox = document.getElementById('dualModeCheckbox');
+const statusEl = document.getElementById('status');
+const trackBarLabel = document.getElementById('trackBarLabel');
+const frameSlider = document.getElementById('frameSlider');
+const qrContainer = document.getElementById('qrContainer');
+const qrSlot2 = document.getElementById('qrSlot2');
+const qrCanvas1 = document.getElementById('qrCanvas1');
+const qrCanvas2 = document.getElementById('qrCanvas2');
+
+let loadedFileBytes = null;
+let loadedFileName = null;
+let frames = null;
+let currentIndex = 0; // 常に「表示中の先頭フレーム番号」を指す(2枚モードでは相方は currentIndex+1)
+let running = false;
+let timerId = null;
+let suppressSliderEvent = false;
+
+function log(msg) {
+  statusEl.textContent = msg;
+}
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files && fileInput.files.length > 0) {
+    loadFile(fileInput.files[0]);
+  }
+});
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('dragover');
+});
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('dragover');
+});
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+    loadFile(e.dataTransfer.files[0]);
+  }
+});
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    loadedFileBytes = new Uint8Array(reader.result);
+    loadedFileName = file.name;
+    rebuildFrames();
+    startStopButton.disabled = false;
+  };
+  reader.onerror = () => {
+    alert('ファイルの読み込みに失敗しました: ' + reader.error);
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+chunkSizeInput.addEventListener('change', () => {
+  if (loadedFileBytes !== null) {
+    rebuildFrames();
+  }
+});
+
+dualModeCheckbox.addEventListener('change', () => {
+  applyLayoutMode();
+  if (frames && frames.length > 0) {
+    showFrame(currentIndex, false);
+  }
+});
+
+function rebuildFrames() {
+  if (loadedFileBytes === null || loadedFileName === null) {
+    return;
+  }
+  try {
+    const chunkCapacity = parseInt(chunkSizeInput.value, 10);
+    frames = buildFrames(loadedFileBytes, loadedFileName, chunkCapacity);
+    currentIndex = 0;
+
+    if (running) {
+      stopSending();
+    }
+
+    log('読み込み完了: ' + loadedFileBytes.length + ' バイト / ' + frames.length +
+        ' フレームに分割しました。(1枚あたり最大約' + chunkCapacity + 'バイト)');
+
+    frameSlider.disabled = frames.length <= 1;
+    frameSlider.min = 0;
+    frameSlider.max = Math.max(0, frames.length - 1);
+
+    showFrame(0, true);
+  } catch (e) {
+    alert('フレーム分割に失敗しました: ' + e.message);
+  }
+}
+
+startStopButton.addEventListener('click', () => {
+  if (!frames || frames.length === 0) {
+    return;
+  }
+  if (running) {
+    stopSending();
+  } else {
+    startSending();
+  }
+});
+
+function getStep() {
+  // 2枚同時表示の場合、1回の切替で2フレーム進む
+  return dualModeCheckbox.checked ? 2 : 1;
+}
+
+function startSending() {
+  const interval = parseInt(intervalInput.value, 10);
+  timerId = setInterval(() => {
+    const step = getStep();
+    currentIndex = (currentIndex + step) % frames.length;
+    showFrame(currentIndex, true);
+  }, interval);
+  running = true;
+  startStopButton.textContent = '送信停止';
+  fileInput.disabled = true;
+  chunkSizeInput.disabled = true;
+}
+
+function stopSending() {
+  if (timerId !== null) {
+    clearInterval(timerId);
+    timerId = null;
+  }
+  running = false;
+  startStopButton.textContent = '送信開始';
+  fileInput.disabled = false;
+  chunkSizeInput.disabled = false;
+}
+
+frameSlider.addEventListener('input', () => {
+  if (suppressSliderEvent) {
+    return;
+  }
+  if (!frames || frames.length === 0) {
+    return;
+  }
+  if (running) {
+    stopSending();
+  }
+  currentIndex = parseInt(frameSlider.value, 10);
+  showFrame(currentIndex, false);
+});
+
+/**
+ * 表示領域(#qrContainer)の実際の描画サイズ(幅・高さ)を見て、
+ * 横長なら横並び(dual-horizontal)、縦長なら縦並び(dual-vertical)のクラスを付け替える。
+ * 1枚モードの場合は正方形(single)に固定する。
+ */
+function applyLayoutMode() {
+  qrContainer.classList.remove('single', 'dual-horizontal', 'dual-vertical');
+
+  if (!dualModeCheckbox.checked) {
+    qrContainer.classList.add('single');
+    qrSlot2.classList.add('hidden');
+    return;
+  }
+
+  qrSlot2.classList.remove('hidden');
+
+  // レイアウト判定のため、一時的に「横長」クラスを当てて実測してから、
+  // 実際に使えるサイズ(親要素の幅)を基準に縦横どちらが広く使えるか判定する。
+  // ここでは #qrContainer の親要素の表示幅と、ウィンドウの縦横比を参考にする。
+  const parent = qrContainer.parentElement;
+  const availableWidth = parent ? parent.clientWidth : window.innerWidth;
+  const availableHeight = window.innerHeight * 0.6; // 画面下部の余白を考慮した目安
+
+  // 「横に2枚並べたときの1枚あたりの一辺」と「縦に2枚並べたときの1枚あたりの一辺」を比較し、
+  // 大きく表示できる(=QRコードが読み取りやすい)方を採用する。
+  const horizontalCellSize = Math.min(availableWidth / 2, availableHeight);
+  const verticalCellSize = Math.min(availableWidth, availableHeight / 2);
+
+  if (horizontalCellSize >= verticalCellSize) {
+    qrContainer.classList.add('dual-horizontal');
+  } else {
+    qrContainer.classList.add('dual-vertical');
+  }
+}
+
+window.addEventListener('resize', () => {
+  if (dualModeCheckbox.checked) {
+    applyLayoutMode();
+  }
+});
+
+function showFrame(index, updateSlider) {
+  if (!frames || frames.length === 0) {
+    return;
+  }
+
+  applyLayoutMode();
+
+  renderFrameToCanvas(frames[index], qrCanvas1);
+
+  if (dualModeCheckbox.checked) {
+    const secondIndex = index + 1;
+    if (secondIndex < frames.length) {
+      qrSlot2.classList.remove('hidden');
+      renderFrameToCanvas(frames[secondIndex], qrCanvas2);
+    } else {
+      // 総フレーム数が奇数で、相方が存在しない場合は1枚のみ表示する
+      qrSlot2.classList.add('hidden');
+    }
+  }
+
+  if (updateSlider) {
+    suppressSliderEvent = true;
+    frameSlider.value = String(Math.min(index, parseInt(frameSlider.max, 10)));
+    suppressSliderEvent = false;
+  }
+
+  const step = getStep();
+  const displayEnd = Math.min(index + step, frames.length);
+  const rangeText = step > 1 ? (index + 1) + '-' + displayEnd : String(index + 1);
+
+  trackBarLabel.textContent = '表示フレーム: ' + rangeText + ' / ' + frames.length +
+      '(スライダーで任意のフレームへジャンプできます)';
+
+  log('フレーム ' + rangeText + ' / ' + frames.length + ' を表示中' +
+      (running ? '(自動送信中)' : '(手動表示中)') +
+      (dualModeCheckbox.checked ? ' [2枚同時表示]' : ''));
+}
+
+function renderFrameToCanvas(payload, canvas) {
+  const binaryString = bytesToBinaryString(payload);
+
+  // typeNumber=0(自動判定)、誤り訂正レベルL固定
+  const qr = qrcode(0, 'L');
+  qr.addData(binaryString, 'Byte');
+  qr.make();
+
+  renderQrToCanvas(qr, canvas);
+}
+
+function renderQrToCanvas(qr, canvas) {
+  const moduleCount = qr.getModuleCount();
+  // キャンバスは正方形、モジュール単位で敷き詰める(拡大縮小はCSS側のwidth/height:100%が担当)
+  const cellPixels = 8;
+  const size = moduleCount * cellPixels;
+  canvas.width = size;
+  canvas.height = size;
+
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#000000';
+
+  for (let row = 0; row < moduleCount; row++) {
+    for (let col = 0; col < moduleCount; col++) {
+      if (qr.isDark(row, col)) {
+        ctx.fillRect(col * cellPixels, row * cellPixels, cellPixels, cellPixels);
+      }
+    }
+  }
+}
+</script>
+</body>
+</html>
