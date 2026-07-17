@@ -2,15 +2,21 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
 <title>QR File Sender (Web版)</title>
 <style>
+  html, body {
+    height: 100%;
+  }
   body {
     font-family: sans-serif;
     background: #222;
     color: #eee;
     margin: 0;
     padding: 16px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
   }
   h2 { margin-top: 0; }
   .row {
@@ -58,31 +64,28 @@
   #frameSlider { width: 100%; }
 
   /*
-    表示領域全体。1枚モードでは正方形(aspect-ratio 1/1)、
-    2枚モードでは横長(2:1)または縦長(1:2)にJSで切り替える。
-    どちらの場合も、幅いっぱいに内接させる。
+    表示領域の外側ラッパー。この中でJSが #qrContainer のwidth/heightを
+    px指定で明示的に制御する(aspect-ratioやmax-widthに頼らない)。
+    残り高さを最大限使うため flex:1 で伸縮させる。
   */
-  #qrContainer {
+  #qrOuter {
     display: flex;
     justify-content: center;
     align-items: center;
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+  }
+
+  /*
+    実際にQRコードを並べるコンテナ。幅・高さはJSが都度計算してpx指定する。
+    flex-direction(row/column)もJSが切り替える。
+  */
+  #qrContainer {
+    display: flex;
     background: white;
     border: 1px solid #555;
-    width: 100%;
-    max-width: 480px;
-    margin: 0 auto;
-    gap: 2px;
-  }
-  #qrContainer.single {
-    aspect-ratio: 1 / 1;
-  }
-  #qrContainer.dual-horizontal {
-    aspect-ratio: 2 / 1; /* 横に2枚並べる: 幅は高さの2倍 */
-    flex-direction: row;
-  }
-  #qrContainer.dual-vertical {
-    aspect-ratio: 1 / 2; /* 縦に2枚並べる: 高さは幅の2倍 */
-    flex-direction: column;
+    box-sizing: border-box;
   }
   .qrSlot {
     flex: 1 1 0;
@@ -92,6 +95,7 @@
     justify-content: center;
     align-items: center;
     overflow: hidden;
+    box-sizing: border-box;
   }
   .qrSlot canvas {
     width: 100%;
@@ -136,9 +140,11 @@
 
 <div id="status">ファイルを選択してください。</div>
 
-<div id="qrContainer" class="single">
-  <div class="qrSlot" id="qrSlot1"><canvas id="qrCanvas1"></canvas></div>
-  <div class="qrSlot hidden" id="qrSlot2"><canvas id="qrCanvas2"></canvas></div>
+<div id="qrOuter">
+  <div id="qrContainer">
+    <div class="qrSlot" id="qrSlot1"><canvas id="qrCanvas1"></canvas></div>
+    <div class="qrSlot hidden" id="qrSlot2"><canvas id="qrCanvas2"></canvas></div>
+  </div>
 </div>
 
 <!--
@@ -275,6 +281,7 @@ const dualModeCheckbox = document.getElementById('dualModeCheckbox');
 const statusEl = document.getElementById('status');
 const trackBarLabel = document.getElementById('trackBarLabel');
 const frameSlider = document.getElementById('frameSlider');
+const qrOuter = document.getElementById('qrOuter');
 const qrContainer = document.getElementById('qrContainer');
 const qrSlot2 = document.getElementById('qrSlot2');
 const qrCanvas1 = document.getElementById('qrCanvas1');
@@ -360,6 +367,7 @@ function rebuildFrames() {
     frameSlider.min = 0;
     frameSlider.max = Math.max(0, frames.length - 1);
 
+    applyLayoutMode();
     showFrame(0, true);
   } catch (e) {
     alert('フレーム分割に失敗しました: ' + e.message);
@@ -421,52 +429,107 @@ frameSlider.addEventListener('input', () => {
 });
 
 /**
- * 表示領域(#qrContainer)の実際の描画サイズ(幅・高さ)を見て、
- * 横長なら横並び(dual-horizontal)、縦長なら縦並び(dual-vertical)のクラスを付け替える。
- * 1枚モードの場合は正方形(single)に固定する。
+ * 表示領域(#qrOuter の実測サイズ)を基準に、#qrContainer の幅・高さをpxで
+ * 明示的に計算・設定する。aspect-ratioやmax-widthに頼らないため、
+ * モバイルでアドレスバーの表示/非表示によって使える高さが変動しても、
+ * その時点の実測値に追従できる。
+ *
+ * 1枚モード: 正方形。#qrOuterに収まる最大の正方形。
+ * 2枚モード: 横並び(2:1)か縦並び(1:2)かを、実際に大きく表示できる方で選び、
+ *            その形で #qrOuter に収まる最大サイズにする。
+ *
+ * パディングは、コンテナの長辺(横並びなら幅、縦並びなら高さ)に対する
+ * 数パーセントを、QR間の隙間として確保する。
  */
 function applyLayoutMode() {
-  qrContainer.classList.remove('single', 'dual-horizontal', 'dual-vertical');
+  const outerRect = qrOuter.getBoundingClientRect();
+  const availableWidth = Math.max(0, outerRect.width);
+  const availableHeight = Math.max(0, outerRect.height);
+
+  const paddingRatio = 0.03; // 長辺に対するパディング比率(3%)
 
   if (!dualModeCheckbox.checked) {
-    qrContainer.classList.add('single');
     qrSlot2.classList.add('hidden');
+    qrContainer.style.flexDirection = 'row';
+    qrContainer.style.gap = '0px';
+
+    const side = Math.min(availableWidth, availableHeight);
+    qrContainer.style.width = side + 'px';
+    qrContainer.style.height = side + 'px';
     return;
   }
 
   qrSlot2.classList.remove('hidden');
 
-  // レイアウト判定のため、一時的に「横長」クラスを当てて実測してから、
-  // 実際に使えるサイズ(親要素の幅)を基準に縦横どちらが広く使えるか判定する。
-  // ここでは #qrContainer の親要素の表示幅と、ウィンドウの縦横比を参考にする。
-  const parent = qrContainer.parentElement;
-  const availableWidth = parent ? parent.clientWidth : window.innerWidth;
-  const availableHeight = window.innerHeight * 0.6; // 画面下部の余白を考慮した目安
+  // 横並び(2:1)にした場合、#qrOuterに収まる最大サイズを試算
+  // 幅方向: 幅 = availableWidth, 高さ = availableWidth / 2
+  // 高さ方向: 高さ = availableHeight, 幅 = availableHeight * 2
+  // 両方の制約を満たす最大サイズを採用する
+  const horizontalWidthByW = availableWidth;
+  const horizontalHeightByW = availableWidth / 2;
+  const horizontalWidthByH = availableHeight * 2;
+  const horizontalHeightByH = availableHeight;
+  let horizontalWidth, horizontalHeight;
+  if (horizontalHeightByW <= availableHeight) {
+    horizontalWidth = horizontalWidthByW;
+    horizontalHeight = horizontalHeightByW;
+  } else {
+    horizontalWidth = horizontalWidthByH;
+    horizontalHeight = horizontalHeightByH;
+  }
 
-  // 「横に2枚並べたときの1枚あたりの一辺」と「縦に2枚並べたときの1枚あたりの一辺」を比較し、
-  // 大きく表示できる(=QRコードが読み取りやすい)方を採用する。
-  const horizontalCellSize = Math.min(availableWidth / 2, availableHeight);
-  const verticalCellSize = Math.min(availableWidth, availableHeight / 2);
+  // 縦並び(1:2)にした場合、#qrOuterに収まる最大サイズを試算
+  const verticalHeightByH = availableHeight;
+  const verticalWidthByH = availableHeight / 2;
+  const verticalHeightByW = availableWidth * 2;
+  const verticalWidthByW = availableWidth;
+  let verticalWidth, verticalHeight;
+  if (verticalWidthByH <= availableWidth) {
+    verticalWidth = verticalWidthByH;
+    verticalHeight = verticalHeightByH;
+  } else {
+    verticalWidth = verticalWidthByW;
+    verticalHeight = verticalHeightByW;
+  }
+
+  // 各QRコード1枚あたりの一辺の長さが大きい方(=読み取りやすい方)を採用する
+  const horizontalCellSize = horizontalHeight; // 横並びなら1枚の一辺は高さと一致
+  const verticalCellSize = verticalWidth;      // 縦並びなら1枚の一辺は幅と一致
 
   if (horizontalCellSize >= verticalCellSize) {
-    qrContainer.classList.add('dual-horizontal');
+    qrContainer.style.flexDirection = 'row';
+    const gapPx = Math.round(horizontalWidth * paddingRatio);
+    qrContainer.style.gap = gapPx + 'px';
+    qrContainer.style.width = horizontalWidth + 'px';
+    qrContainer.style.height = horizontalHeight + 'px';
   } else {
-    qrContainer.classList.add('dual-vertical');
+    qrContainer.style.flexDirection = 'column';
+    const gapPx = Math.round(verticalHeight * paddingRatio);
+    qrContainer.style.gap = gapPx + 'px';
+    qrContainer.style.width = verticalWidth + 'px';
+    qrContainer.style.height = verticalHeight + 'px';
   }
 }
 
+// resizeに加え、モバイルでアドレスバーの表示/非表示によってビューポートの
+// 実効サイズが変わった場合にも追従できるよう、visualViewportのresizeも監視する。
 window.addEventListener('resize', () => {
-  if (dualModeCheckbox.checked) {
+  if (frames && frames.length > 0) {
     applyLayoutMode();
   }
 });
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', () => {
+    if (frames && frames.length > 0) {
+      applyLayoutMode();
+    }
+  });
+}
 
 function showFrame(index, updateSlider) {
   if (!frames || frames.length === 0) {
     return;
   }
-
-  applyLayoutMode();
 
   renderFrameToCanvas(frames[index], qrCanvas1);
 
@@ -515,8 +578,14 @@ function renderQrToCanvas(qr, canvas) {
   // キャンバスは正方形、モジュール単位で敷き詰める(拡大縮小はCSS側のwidth/height:100%が担当)
   const cellPixels = 8;
   const size = moduleCount * cellPixels;
-  canvas.width = size;
-  canvas.height = size;
+
+  // サイズが変わらない場合、width/heightへの再代入自体を避ける
+  // (canvasのwidth/height代入は内容を強制クリアする副作用があり、
+  //  値が同じでも毎回代入するとちらつきや余計な再描画コストにつながるため)
+  if (canvas.width !== size || canvas.height !== size) {
+    canvas.width = size;
+    canvas.height = size;
+  }
 
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#ffffff';
