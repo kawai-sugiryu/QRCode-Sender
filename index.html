@@ -191,7 +191,7 @@
 
 <div class="row">
   <label for="intervalInput">切替間隔(ms):</label>
-  <input type="number" id="intervalInput" value="800" min="200" max="10000" step="100">
+  <input type="number" id="intervalInput" value="300" min="200" max="10000" step="100">
 
   <label for="chunkSizeInput">1枚あたりバイト数:</label>
   <input type="number" id="chunkSizeInput" value="100" min="16" max="1000" step="10">
@@ -360,6 +360,7 @@ const qrCanvas2 = document.getElementById('qrCanvas2');
 
 let loadedFileBytes = null;
 let loadedFileName = null;
+let loadNotice = '';
 let frames = null;
 let currentIndex = 0; // 常に「表示中の先頭フレーム番号」を指す(2枚モードでは相方は currentIndex+1)
 let running = false;
@@ -393,16 +394,182 @@ dropZone.addEventListener('drop', (e) => {
 
 function loadFile(file) {
   const reader = new FileReader();
-  reader.onload = () => {
-    loadedFileBytes = new Uint8Array(reader.result);
-    loadedFileName = file.name;
-    rebuildFrames();
-    startStopButton.disabled = false;
+  reader.onload = async () => {
+    try {
+      let bytes = new Uint8Array(reader.result);
+      let name = file.name;
+      loadNotice = '';
+
+      // 拡張子が .zip でなければ、ZIPに圧縮してから送信する
+      if (!/\.zip$/i.test(name)) {
+        const originalSize = bytes.length;
+        bytes = await createZip(name, bytes, file.lastModified);
+        name = name + '.zip';
+        loadNotice = 'ZIP圧縮: ' + originalSize + ' → ' + bytes.length + ' バイト / ';
+      }
+
+      loadedFileBytes = bytes;
+      loadedFileName = name;
+
+      // 最終フレームが最も大きくなる1枚あたりバイト数を自動設定する
+      const best = findBestChunkCapacity(bytes.length, new TextEncoder().encode(name).length);
+      chunkSizeInput.value = String(best);
+
+      rebuildFrames();
+      startStopButton.disabled = false;
+    } catch (e) {
+      alert('ファイルの処理に失敗しました: ' + e.message);
+    }
   };
   reader.onerror = () => {
     alert('ファイルの読み込みに失敗しました: ' + reader.error);
   };
   reader.readAsArrayBuffer(file);
+}
+
+// ============================================================
+// 1枚あたりバイト数の自動設定
+// 範囲内の各値でフレーム分割を試算し、最終フレームのデータ量が最大になる値を選ぶ。
+// 最終フレームだけデータが極端に少ないと、QRのマーカー比率が大きくなり
+// 読み取り品質が下がるための対策。同点の場合は大きい値(=総フレーム数が少ない方)を優先する。
+// ============================================================
+const AUTO_CAPACITY_MIN = 156;
+const AUTO_CAPACITY_MAX = 216;
+
+function findBestChunkCapacity(dataLength, fileNameLength) {
+  let bestCap = AUTO_CAPACITY_MAX;
+  let bestLast = -1;
+  for (let cap = AUTO_CAPACITY_MAX; cap >= AUTO_CAPACITY_MIN; cap--) {
+    const firstMax = cap - 8 - fileNameLength;
+    const restMax = cap - 7;
+    if (firstMax <= 0) {
+      continue;
+    }
+    let lastLen;
+    if (dataLength <= firstMax) {
+      lastLen = dataLength; // 1フレームのみ
+    } else {
+      const remain = dataLength - firstMax;
+      lastLen = remain % restMax;
+      if (lastLen === 0) {
+        lastLen = restMax;
+      }
+    }
+    if (lastLen > bestLast) { // 大きい値から走査しているので、同点なら大きい値が残る
+      bestLast = lastLen;
+      bestCap = cap;
+    }
+  }
+  return bestCap;
+}
+
+// ============================================================
+// ZIP作成(単一ファイル)
+// deflate-raw圧縮(CompressionStream対応ブラウザ)を試み、非対応または
+// 圧縮しても小さくならない場合は無圧縮(stored)で格納する。
+// ============================================================
+const crcTable = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = crcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+async function deflateRaw(bytes) {
+  if (typeof CompressionStream === 'undefined') {
+    return null;
+  }
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch (e) {
+    return null;
+  }
+}
+
+async function createZip(entryName, data, lastModified) {
+  const nameBytes = new TextEncoder().encode(entryName);
+  const crc = crc32(data);
+
+  let method = 0;
+  let body = data;
+  const deflated = await deflateRaw(data);
+  if (deflated !== null && deflated.length < data.length) {
+    method = 8;
+    body = deflated;
+  }
+
+  const d = new Date(lastModified || Date.now());
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const dosDate = (Math.max(0, d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+
+  const localSize = 30 + nameBytes.length;
+  const centralSize = 46 + nameBytes.length;
+  const total = localSize + body.length + centralSize + 22;
+  const out = new Uint8Array(total);
+  const v = new DataView(out.buffer);
+  let p = 0;
+
+  // ローカルファイルヘッダ
+  v.setUint32(p, 0x04034b50, true); p += 4;
+  v.setUint16(p, 20, true); p += 2;
+  v.setUint16(p, 0x0800, true); p += 2; // UTF-8ファイル名
+  v.setUint16(p, method, true); p += 2;
+  v.setUint16(p, dosTime, true); p += 2;
+  v.setUint16(p, dosDate, true); p += 2;
+  v.setUint32(p, crc, true); p += 4;
+  v.setUint32(p, body.length, true); p += 4;
+  v.setUint32(p, data.length, true); p += 4;
+  v.setUint16(p, nameBytes.length, true); p += 2;
+  v.setUint16(p, 0, true); p += 2;
+  out.set(nameBytes, p); p += nameBytes.length;
+  out.set(body, p); p += body.length;
+
+  // セントラルディレクトリ
+  const centralOffset = p;
+  v.setUint32(p, 0x02014b50, true); p += 4;
+  v.setUint16(p, 20, true); p += 2;
+  v.setUint16(p, 20, true); p += 2;
+  v.setUint16(p, 0x0800, true); p += 2;
+  v.setUint16(p, method, true); p += 2;
+  v.setUint16(p, dosTime, true); p += 2;
+  v.setUint16(p, dosDate, true); p += 2;
+  v.setUint32(p, crc, true); p += 4;
+  v.setUint32(p, body.length, true); p += 4;
+  v.setUint32(p, data.length, true); p += 4;
+  v.setUint16(p, nameBytes.length, true); p += 2;
+  v.setUint16(p, 0, true); p += 2; // extra
+  v.setUint16(p, 0, true); p += 2; // comment
+  v.setUint16(p, 0, true); p += 2; // disk
+  v.setUint16(p, 0, true); p += 2; // internal attr
+  v.setUint32(p, 0, true); p += 4; // external attr
+  v.setUint32(p, 0, true); p += 4; // local header offset
+  out.set(nameBytes, p); p += nameBytes.length;
+
+  // End of central directory
+  v.setUint32(p, 0x06054b50, true); p += 4;
+  v.setUint16(p, 0, true); p += 2;
+  v.setUint16(p, 0, true); p += 2;
+  v.setUint16(p, 1, true); p += 2;
+  v.setUint16(p, 1, true); p += 2;
+  v.setUint32(p, centralSize, true); p += 4;
+  v.setUint32(p, centralOffset, true); p += 4;
+  v.setUint16(p, 0, true); p += 2;
+
+  return out;
 }
 
 chunkSizeInput.addEventListener('change', () => {
@@ -431,7 +598,7 @@ function rebuildFrames() {
       stopSending();
     }
 
-    log('読み込み完了: ' + loadedFileBytes.length + ' バイト / ' + frames.length +
+    log(loadNotice + '読み込み完了: ' + loadedFileBytes.length + ' バイト / ' + frames.length +
         ' フレームに分割しました。(1枚あたり最大約' + chunkCapacity + 'バイト)');
 
     frameSlider.disabled = frames.length <= 1;
@@ -497,6 +664,32 @@ frameSlider.addEventListener('input', () => {
   }
   currentIndex = parseInt(frameSlider.value, 10);
   showFrame(currentIndex, false);
+});
+
+// 左右キーで現在フレームから前後に1フレームずつ移動する(左=index-1、右=index+1)。
+// 送信中でも動作し、移動後のフレームから自動送信が続く(端はループする)。
+// 数値入力欄・ファイル選択欄にフォーカスがある間は、それらの本来の操作を優先する。
+// スライダーにフォーカスがある場合は、標準の矢印キー動作との二重移動を避けるため
+// 標準動作を打ち消して、こちらの処理だけを行う。
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') {
+    return;
+  }
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) {
+    return;
+  }
+  const target = e.target;
+  if (target && target.tagName === 'INPUT' && target.type !== 'range' && target.type !== 'checkbox') {
+    return;
+  }
+  if (!frames || frames.length === 0) {
+    return;
+  }
+
+  e.preventDefault();
+  const delta = e.key === 'ArrowRight' ? 1 : -1;
+  currentIndex = (currentIndex + delta + frames.length) % frames.length;
+  showFrame(currentIndex, true);
 });
 
 /**
