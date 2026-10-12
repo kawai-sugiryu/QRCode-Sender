@@ -10,7 +10,7 @@
   }
   body {
     font-family: sans-serif;
-    background: #eee;
+    background: #f0f0f0;
     color: #222;
     margin: 0;
     padding: 16px;
@@ -30,61 +30,86 @@
   input[type="number"] {
     width: 80px;
     padding: 4px;
+    background: #fff;
+    color: #222;
+    border: 1px solid #aaa;
+    border-radius: 3px;
   }
   button {
     padding: 8px 16px;
     font-size: 14px;
     cursor: pointer;
+    background: #e1e1e1;
+    color: #222;
+    border: 1px solid #999;
+    border-radius: 3px;
   }
   button:disabled {
     cursor: not-allowed;
     opacity: 0.5;
   }
   #dropZone {
-    border: 2px dashed #555;
+    border: 2px dashed #999;
     border-radius: 8px;
     padding: 16px;
     text-align: center;
     margin-bottom: 10px;
-    background: #2a2a2a;
+    background: #fafafa;
   }
   #dropZone.dragover {
     border-color: #4caf50;
-    background: #ddd;
+    background: #eaf7ea;
   }
   #status {
     white-space: pre-wrap;
     font-family: monospace;
-    background: #ddd;
+    background: #fff;
+    color: #222;
+    border: 1px solid #ccc;
     padding: 8px;
     margin-bottom: 10px;
     min-height: 20px;
   }
-  #trackBarLabel { font-size: 13px; color: #ccc; margin-bottom: 4px; }
+  #trackBarLabel { font-size: 13px; color: #555; margin-bottom: 4px; }
   #frameSlider { width: 100%; }
 
   /*
     表示領域の外側ラッパー。この中でJSが #qrContainer のwidth/heightを
     px指定で明示的に制御する(aspect-ratioやmax-widthに頼らない)。
     残り高さを最大限使うため flex:1 で伸縮させる。
+
+    背景を白にしているのは、QRコード自体の生成は正しくても、
+    暗い背景(ページ全体のダークテーマ)がQRコードの外周に近すぎると、
+    カメラでの二値化・ファインダーパターン検出に悪影響が出て
+    読み取りに失敗するケースがあったための対策。
+    QRコード規格上のクワイエットゾーン(周囲の白余白)は canvas 内部にも
+    別途確保しているが、それに加えてページ全体としても白い領域を
+    広めに確保している。
   */
   #qrOuter {
     display: flex;
-    justify-content: center;
-    align-items: center;
     flex: 1 1 auto;
     min-height: 0;
     width: 100%;
+    background: white;
+    border-radius: 4px;
+    padding: 12px;
+    box-sizing: border-box;
   }
 
   /*
-    実際にQRコードを並べるコンテナ。幅・高さはJSが都度計算してpx指定する。
-    flex-direction(row/column)もJSが切り替える。
+    実際にQRコードを並べるコンテナ。1枚モードでは中央寄せの単一領域、
+    2枚モードでは表示領域を中央で2分割し、それぞれの区画の中央にQRを
+    配置する(区画そのものが「表示領域の半分」になるため、QR同士の間隔は
+    区画の境界で自然に生まれる。間隔の大きさは各区画内のQRサイズを
+    やや小さめにすることで調整する)。
+    flex-direction(row/column)はJSが実測サイズに応じて切り替える。
   */
   #qrContainer {
     display: flex;
+    width: 100%;
+    height: 100%;
     background: white;
-    border: 1px solid #555;
     box-sizing: border-box;
   }
   .qrSlot {
@@ -98,12 +123,58 @@
     box-sizing: border-box;
   }
   .qrSlot canvas {
-    width: 100%;
-    height: 100%;
     image-rendering: pixelated;
   }
   #qrSlot2.hidden {
     display: none;
+  }
+
+  /*
+    スマホ(縦長・幅の狭い画面)向けの最適化。
+    PC表示と同じ構成(上に操作UI、下に残り全部をQR表示領域)を維持しつつ、
+    操作UI側を詰めてQR表示領域により多くの高さを割り当てる。
+  */
+  @media (max-width: 600px) {
+    body {
+      padding: 8px;
+    }
+    h2 {
+      font-size: 16px;
+      margin-bottom: 8px;
+    }
+    #dropZone {
+      padding: 10px;
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+    .row {
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    label {
+      font-size: 12px;
+    }
+    input[type="number"] {
+      width: 64px;
+      padding: 3px;
+    }
+    button {
+      padding: 6px 12px;
+      font-size: 13px;
+    }
+    #dualModeLabelText {
+      font-size: 12px;
+    }
+    #trackBarLabel {
+      font-size: 11px;
+      margin-bottom: 2px;
+    }
+    #status {
+      font-size: 12px;
+      padding: 6px;
+      margin-bottom: 6px;
+      min-height: 0;
+    }
   }
 </style>
 </head>
@@ -131,7 +202,7 @@
 <div class="row">
   <label>
     <input type="checkbox" id="dualModeCheckbox">
-    2枚同時表示(1回の切替で2フレーム進みます。表示領域の縦横比に応じて自動で縦並び/横並びになります)
+    <span id="dualModeLabelText">2枚同時表示(1回の切替で2フレーム進みます。表示領域の縦横比に応じて自動で縦並び/横並びになります)</span>
   </label>
 </div>
 
@@ -429,86 +500,63 @@ frameSlider.addEventListener('input', () => {
 });
 
 /**
- * 表示領域(#qrOuter の実測サイズ)を基準に、#qrContainer の幅・高さをpxで
+ * 表示領域(#qrOuter の実測サイズ)を基準に、各QRコードのcanvasサイズをpxで
  * 明示的に計算・設定する。aspect-ratioやmax-widthに頼らないため、
  * モバイルでアドレスバーの表示/非表示によって使える高さが変動しても、
  * その時点の実測値に追従できる。
  *
- * 1枚モード: 正方形。#qrOuterに収まる最大の正方形。
- * 2枚モード: 横並び(2:1)か縦並び(1:2)かを、実際に大きく表示できる方で選び、
- *            その形で #qrOuter に収まる最大サイズにする。
- *
- * パディングは、コンテナの長辺(横並びなら幅、縦並びなら高さ)に対する
- * 数パーセントを、QR間の隙間として確保する。
+ * 1枚モード: #qrContainer全体を1区画として使い、その中央に正方形のQRを表示。
+ * 2枚モード: #qrContainer を中央で2分割(縦長なら上下、横長なら左右)し、
+ *            それぞれの区画の中央に正方形のQRを表示する。
+ *            QR同士の間隔は、各区画のサイズに対してQRのサイズを
+ *            ややに小さく(paddingRatio分)することで区画の境界に余白として生まれる。
  */
 function applyLayoutMode() {
   const outerRect = qrOuter.getBoundingClientRect();
-  const availableWidth = Math.max(0, outerRect.width);
-  const availableHeight = Math.max(0, outerRect.height);
+  const outerPadding = 12 * 2; // #qrOuter の左右(または上下)合計パディング(CSSのpadding値と合わせること)
+  const availableWidth = Math.max(0, outerRect.width - outerPadding);
+  const availableHeight = Math.max(0, outerRect.height - outerPadding);
 
-  const paddingRatio = 0.03; // 長辺に対するパディング比率(3%)
+  const paddingRatio = 0.06; // 各区画のサイズに対するQRの余白比率(6%)
 
   if (!dualModeCheckbox.checked) {
     qrSlot2.classList.add('hidden');
     qrContainer.style.flexDirection = 'row';
-    qrContainer.style.gap = '0px';
 
     const side = Math.min(availableWidth, availableHeight);
-    qrContainer.style.width = side + 'px';
-    qrContainer.style.height = side + 'px';
+    setCanvasBoxSize(qrCanvas1, side);
     return;
   }
 
   qrSlot2.classList.remove('hidden');
 
-  // 横並び(2:1)にした場合、#qrOuterに収まる最大サイズを試算
-  // 幅方向: 幅 = availableWidth, 高さ = availableWidth / 2
-  // 高さ方向: 高さ = availableHeight, 幅 = availableHeight * 2
-  // 両方の制約を満たす最大サイズを採用する
-  const horizontalWidthByW = availableWidth;
-  const horizontalHeightByW = availableWidth / 2;
-  const horizontalWidthByH = availableHeight * 2;
-  const horizontalHeightByH = availableHeight;
-  let horizontalWidth, horizontalHeight;
-  if (horizontalHeightByW <= availableHeight) {
-    horizontalWidth = horizontalWidthByW;
-    horizontalHeight = horizontalHeightByW;
-  } else {
-    horizontalWidth = horizontalWidthByH;
-    horizontalHeight = horizontalHeightByH;
-  }
+  // 表示領域が横長なら左右2分割、縦長(またはスマホ)なら上下2分割にする
+  const isWide = availableWidth >= availableHeight;
 
-  // 縦並び(1:2)にした場合、#qrOuterに収まる最大サイズを試算
-  const verticalHeightByH = availableHeight;
-  const verticalWidthByH = availableHeight / 2;
-  const verticalHeightByW = availableWidth * 2;
-  const verticalWidthByW = availableWidth;
-  let verticalWidth, verticalHeight;
-  if (verticalWidthByH <= availableWidth) {
-    verticalWidth = verticalWidthByH;
-    verticalHeight = verticalHeightByH;
-  } else {
-    verticalWidth = verticalWidthByW;
-    verticalHeight = verticalHeightByW;
-  }
-
-  // 各QRコード1枚あたりの一辺の長さが大きい方(=読み取りやすい方)を採用する
-  const horizontalCellSize = horizontalHeight; // 横並びなら1枚の一辺は高さと一致
-  const verticalCellSize = verticalWidth;      // 縦並びなら1枚の一辺は幅と一致
-
-  if (horizontalCellSize >= verticalCellSize) {
+  let slotWidth, slotHeight;
+  if (isWide) {
     qrContainer.style.flexDirection = 'row';
-    const gapPx = Math.round(horizontalWidth * paddingRatio);
-    qrContainer.style.gap = gapPx + 'px';
-    qrContainer.style.width = horizontalWidth + 'px';
-    qrContainer.style.height = horizontalHeight + 'px';
+    slotWidth = availableWidth / 2;
+    slotHeight = availableHeight;
   } else {
     qrContainer.style.flexDirection = 'column';
-    const gapPx = Math.round(verticalHeight * paddingRatio);
-    qrContainer.style.gap = gapPx + 'px';
-    qrContainer.style.width = verticalWidth + 'px';
-    qrContainer.style.height = verticalHeight + 'px';
+    slotWidth = availableWidth;
+    slotHeight = availableHeight / 2;
   }
+
+  // 各区画に収まる最大の正方形のうち、余白比率分を差し引いたサイズをQRの一辺にする
+  const slotSide = Math.min(slotWidth, slotHeight);
+  const qrSide = Math.floor(slotSide * (1 - paddingRatio));
+
+  setCanvasBoxSize(qrCanvas1, qrSide);
+  setCanvasBoxSize(qrCanvas2, qrSide);
+}
+
+/** canvasのCSS表示サイズ(見た目のpx)を正方形で明示的に指定する */
+function setCanvasBoxSize(canvas, sidePx) {
+  const side = Math.max(0, Math.round(sidePx)) + 'px';
+  canvas.style.width = side;
+  canvas.style.height = side;
 }
 
 // resizeに加え、モバイルでアドレスバーの表示/非表示によってビューポートの
@@ -526,6 +574,23 @@ if (window.visualViewport) {
   });
 }
 
+/**
+ * 2枚同時表示モードで index と組み合わせて表示するフレーム番号を返す。
+ * 基本は index+1(奇数番目・偶数番目のペア)。
+ * 総フレーム数が奇数で、最終フレームにその規則での相方がいない場合は、
+ * 直前のフレーム(index-1)と組み合わせる(先頭フレームの固定表示に
+ * 偏らせず、直近のフレームと並べることで表示上の違和感を減らす)。
+ */
+function getPairedIndex(index) {
+  if (index + 1 < frames.length) {
+    return index + 1;
+  }
+  if (index - 1 >= 0) {
+    return index - 1;
+  }
+  return 0; // フレームが1枚しかない場合
+}
+
 function showFrame(index, updateSlider) {
   if (!frames || frames.length === 0) {
     return;
@@ -534,14 +599,9 @@ function showFrame(index, updateSlider) {
   renderFrameToCanvas(frames[index], qrCanvas1);
 
   if (dualModeCheckbox.checked) {
-    const secondIndex = index + 1;
-    if (secondIndex < frames.length) {
-      qrSlot2.classList.remove('hidden');
-      renderFrameToCanvas(frames[secondIndex], qrCanvas2);
-    } else {
-      // 総フレーム数が奇数で、相方が存在しない場合は1枚のみ表示する
-      qrSlot2.classList.add('hidden');
-    }
+    qrSlot2.classList.remove('hidden');
+    const secondIndex = getPairedIndex(index);
+    renderFrameToCanvas(frames[secondIndex], qrCanvas2);
   }
 
   if (updateSlider) {
@@ -550,9 +610,13 @@ function showFrame(index, updateSlider) {
     suppressSliderEvent = false;
   }
 
-  const step = getStep();
-  const displayEnd = Math.min(index + step, frames.length);
-  const rangeText = step > 1 ? (index + 1) + '-' + displayEnd : String(index + 1);
+  let rangeText;
+  if (dualModeCheckbox.checked) {
+    const secondIndex = getPairedIndex(index);
+    rangeText = (index + 1) + '+' + (secondIndex + 1);
+  } else {
+    rangeText = String(index + 1);
+  }
 
   trackBarLabel.textContent = '表示フレーム: ' + rangeText + ' / ' + frames.length +
       '(スライダーで任意のフレームへジャンプできます)';
@@ -575,9 +639,9 @@ function renderFrameToCanvas(payload, canvas) {
 
 function renderQrToCanvas(qr, canvas) {
   const moduleCount = qr.getModuleCount();
-  // キャンバスは正方形、モジュール単位で敷き詰める(拡大縮小はCSS側のwidth/height:100%が担当)
   const cellPixels = 8;
-  const size = moduleCount * cellPixels;
+  const quietZoneModules = 4; // QRコード規格上の推奨最小値
+  const size = (moduleCount + quietZoneModules * 2) * cellPixels;
 
   // サイズが変わらない場合、width/heightへの再代入自体を避ける
   // (canvasのwidth/height代入は内容を強制クリアする副作用があり、
@@ -592,10 +656,12 @@ function renderQrToCanvas(qr, canvas) {
   ctx.fillRect(0, 0, size, size);
   ctx.fillStyle = '#000000';
 
+  const offset = quietZoneModules * cellPixels;
+
   for (let row = 0; row < moduleCount; row++) {
     for (let col = 0; col < moduleCount; col++) {
       if (qr.isDark(row, col)) {
-        ctx.fillRect(col * cellPixels, row * cellPixels, cellPixels, cellPixels);
+        ctx.fillRect(offset + col * cellPixels, offset + row * cellPixels, cellPixels, cellPixels);
       }
     }
   }
